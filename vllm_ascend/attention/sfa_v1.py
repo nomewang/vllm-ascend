@@ -37,6 +37,8 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, _round_up, dispose_layer,
                                enable_dsa_cp, maybe_trans_nz)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -340,7 +342,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
-
+        self.enable_c8_indexer = True
         # MLA Args
         self.q_lora_rank = kwargs['q_lora_rank']
         self.kv_lora_rank = kwargs['kv_lora_rank']
@@ -949,6 +951,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_pe = q_pe.squeeze(2)
             q = torch.cat([q_pe, q_nope], dim=-1)  # [b*s,64,128]
 
+        if self.enable_c8_indexer:
+            soc_version = get_ascend_device_type()
+            dst_type = torch.float8_e4m3fn if soc_version in {AscendDeviceType.A5} else torch.int8
+
+            q_shape = q.shape
+
+            q, q_scale = torch_npu.npu_dynamic_quant(q.view(-1, self.head_dim), dst_type=dst_type)
+            k, k_scale = torch_npu.npu_dynamic_quant(k.view(-1, self.head_dim), dst_type=dst_type)
+
+            if soc_version not in {AscendDeviceType.A5}:
+                q_scale = q_scale.to(torch.float16)
+                k_scale = k_scale.to(torch.float16)
+
         if kv_cache is not None:
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
@@ -957,6 +972,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                                                  -1, 1),
                                              k.view(-1,
                                                     k.shape[-1]))  # b, s, n, d
+            if self.enable_c8_indexer:
+                torch_npu.npu_scatter_nd_update_(kv_cache[3].view(-1, k_scale.shape[-1]),
+                                        attn_metadata.slot_mapping.view(
+                                            -1, 1),
+                                        k_scale.view(-1,
+                                            k_scale.shape[-1]))  # b, s, n, d
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
@@ -966,15 +987,34 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         block_table = attn_metadata.block_tables
 
-        topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
-            query=q,
-            key=kv_cache[2],
-            weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=2048,
-            sparse_mode=3)
+        if self.enable_c8_indexer:
+            topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
+                query=q.view(q_shape),
+                key=kv_cache[2],
+                weights=weights,
+                query_dequant_scale=q_scale.view(q_shape[:-1]),
+                key_dequant_scale=kv_cache[3],
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                query_quant_mode=0,
+                key_quant_mode=0,
+                sparse_count=2048,
+                sparse_mode=3,
+                layout_query="TND",
+                layout_key="PA_BSND",
+            )
+        else:
+            topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
+                query=q,
+                key=kv_cache[2],
+                weights=weights,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=2048,
+                sparse_mode=3)
+
         return topk_indices
