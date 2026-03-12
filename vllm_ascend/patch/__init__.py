@@ -53,20 +53,6 @@
 #       we'll fix this in vLLM soon.
 #    Future Plan:
 #       Remove this patch when vLLM merges the PR.
-# ** 7. File: platform/patch_piecewise_backend.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.compilation.piecewise_backend.create_concrete_args`
-#    Why:
-#       The original `create_concrete_args` creates real tensors instead of fake tensors,
-#       which causes FakeTensorMode mismatch errors during compilation on Ascend NPU.
-#       This happens when using ACL Graph mode with PIECEWISE compilation.
-#    How：
-#       Replace `create_concrete_args` with a version that creates fake tensors
-#       using the current FakeTensorMode from the tracing context.
-#    Related PR (if no, explain why):
-#       This is a workaround for PyTorch Dynamo's FakeTensorMode handling on Ascend.
-#    Future Plan:
-#       Remove this patch when the root cause is fixed in PyTorch or vLLM.
 #
 # ** 3. File: platform/patch_multiproc_executor.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
