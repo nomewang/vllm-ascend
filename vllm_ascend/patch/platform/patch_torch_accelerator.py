@@ -14,14 +14,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+import torch
 
-import vllm_ascend.patch.platform.patch_distributed  # noqa
-import vllm_ascend.patch.platform.patch_fusion_matcher_compat_ops  # noqa
-import vllm_ascend.patch.platform.patch_mamba_config  # noqa
-import vllm_ascend.patch.platform.patch_sched_yield  # noqa
-import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
-import vllm_ascend.patch.platform.patch_piecewise_backend  # noqa
+_original_empty_cache = None
 
-if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
-    import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
+
+def _npu_empty_cache():
+    try:
+        torch.npu.empty_cache()
+    except Exception:
+        pass
+
+
+def patch_torch_accelerator_empty_cache():
+    global _original_empty_cache
+
+    if _original_empty_cache is not None:
+        return
+
+    if hasattr(torch, 'accelerator') and hasattr(torch.accelerator, 'empty_cache'):
+        _original_empty_cache = torch.accelerator.empty_cache
+        torch.accelerator.empty_cache = _npu_empty_cache
+
+
+patch_torch_accelerator_empty_cache()

@@ -53,6 +53,20 @@
 #       we'll fix this in vLLM soon.
 #    Future Plan:
 #       Remove this patch when vLLM merges the PR.
+# ** 7. File: platform/patch_piecewise_backend.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.compilation.piecewise_backend.create_concrete_args`
+#    Why:
+#       The original `create_concrete_args` creates real tensors instead of fake tensors,
+#       which causes FakeTensorMode mismatch errors during compilation on Ascend NPU.
+#       This happens when using ACL Graph mode with PIECEWISE compilation.
+#    How：
+#       Replace `create_concrete_args` with a version that creates fake tensors
+#       using the current FakeTensorMode from the tracing context.
+#    Related PR (if no, explain why):
+#       This is a workaround for PyTorch Dynamo's FakeTensorMode handling on Ascend.
+#    Future Plan:
+#       Remove this patch when the root cause is fixed in PyTorch or vLLM.
 #
 # ** 3. File: platform/patch_multiproc_executor.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -107,6 +121,21 @@
 #    Future Plan:
 #       remove this patch once upstream no longer requires these global symbols or
 #       provides a backend-safe initialization path.
+#
+# ** 7. File: platform/patch_torch_accelerator.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `torch.accelerator.empty_cache`
+#    Why:
+#       vLLM's memory_profiling function in mem_utils.py calls torch.accelerator.empty_cache()
+#       which doesn't work on NPU. The original vLLM code uses try/except to handle NPU,
+#       but we want to keep vLLM unchanged and handle this in vllm-ascend.
+#    How：
+#       Monkey-patch torch.accelerator.empty_cache to call torch.npu.empty_cache() instead.
+#    Related PR (if no, explain why):
+#       This is a platform-specific adaptation, not suitable for vLLM upstream.
+#    Future Plan:
+#       Remove this patch when vLLM provides a platform-agnostic empty_cache interface
+#       through the Platform class.
 #
 # * Worker Patch:
 # ===============

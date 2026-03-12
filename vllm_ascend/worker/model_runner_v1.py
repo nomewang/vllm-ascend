@@ -275,10 +275,9 @@ class NPUModelRunner(GPUModelRunner):
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
         self.attn_backend = get_attn_backend(
-            0,
-            self.dtype,
-            None,
-            self.block_size,
+            head_size=0,
+            dtype=self.dtype,
+            kv_cache_dtype=None,
             use_mla=self.model_config.use_mla,
             use_sparse=self.use_sparse,
             use_mm_prefix=self.model_config is not None and self.model_config.is_mm_prefix_lm,
@@ -432,7 +431,6 @@ class NPUModelRunner(GPUModelRunner):
     def _use_aclgraph(self) -> bool:
         return (
             self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
             and not self.model_config.enforce_eager
         )
 
@@ -1327,7 +1325,7 @@ class NPUModelRunner(GPUModelRunner):
                     skip_compiled=has_encoder_input,
                 ),
                 self.maybe_get_kv_connector_output(
-                    scheduler_output, clear_metadata=clear_kv_metadata
+                    scheduler_output
                 ) as kv_connector_output,
             ):
                 hidden_states = self._model_forward(
@@ -2206,6 +2204,7 @@ class NPUModelRunner(GPUModelRunner):
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        profile_seq_lens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -2904,7 +2903,8 @@ class NPUModelRunner(GPUModelRunner):
                 # to kernel_block_sizes[0]
                 kernel_block_sizes.append([0])
         if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [[self.cache_config.block_size]]:
-            assert self.cache_config.cpu_offload_gb == 0, (
+            cpu_offload_gb = getattr(self.cache_config, 'cpu_offload_gb', 0)
+            assert cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details."

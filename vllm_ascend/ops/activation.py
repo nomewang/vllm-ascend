@@ -16,7 +16,7 @@
 #
 
 import torch
-from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SwigluOAIAndMul
+from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SwigluOAIAndMul, SwigluStepAndMul
 
 from vllm_ascend.utils import get_weight_prefetch_method
 
@@ -49,3 +49,25 @@ class AscendSwigluOAIAndMul:
 
         layer = MinimalSwigluOAIAndMul()
         return SwigluOAIAndMul.forward_native(layer, x)
+
+
+class AscendSwigluStepAndMul(SwigluStepAndMul):
+    """Ascend optimized SwigluStepAndMul activation function.
+    
+    This is used in Step3p5 models for MoE expert computation.
+    Computes: silu(x[:d]).clamp(max=limit) * x[d:].clamp(-limit, limit)
+    where d = x.shape[-1] // 2.
+    """
+
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        import torch_npu
+
+        d = x.shape[-1] // 2
+        gate = x[..., :d]
+        up = x[..., d:]
+
+        gate_silu = torch_npu.npu_silu(gate)
+        gate_clamped = gate_silu.clamp(max=self.limit)
+        up_clamped = up.clamp(min=-self.limit, max=self.limit)
+
+        return gate_clamped * up_clamped

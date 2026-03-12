@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 
-from vllm_ascend.ops.activation import AscendSiluAndMul
+from vllm_ascend.ops.activation import AscendSiluAndMul, AscendSwigluStepAndMul
 
 
 class AscendSiluAndMul310(AscendSiluAndMul):
@@ -30,3 +30,18 @@ class AscendSiluAndMul310(AscendSiluAndMul):
             h = x.shape[-1] // 2
             out = F.silu(x[..., :h]) * x[..., h:]
         return out
+
+
+class AscendSwigluStepAndMul310(AscendSwigluStepAndMul):
+    """310P optimized SwigluStepAndMul activation function."""
+
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d]
+        up = x[..., d:]
+
+        gate_silu = F.silu(gate)
+        gate_clamped = gate_silu.clamp(max=self.limit)
+        up_clamped = up.clamp(min=-self.limit, max=self.limit)
+
+        return gate_clamped * up_clamped

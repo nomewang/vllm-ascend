@@ -25,12 +25,10 @@ import contextlib
 import tempfile
 from pathlib import Path
 
-import vllm
 from vllm.logger import logger
 
-VLLM_VERSION = vllm.__version__
-# Configuration file name
-CONFIG_FILENAME = f"service_profiling_symbols.{VLLM_VERSION}.yaml"
+VLLM_VERSION = None
+CONFIG_FILENAME = None
 
 # Hard-coded YAML content, default symbols changed by user can be added here.
 SERVICE_PROFILING_SYMBOLS_YAML = """
@@ -153,6 +151,13 @@ def generate_service_profiling_config() -> Path | None:
         Optional[Path]: The path to the generated (or existing) configuration file.
                        Returns None if file creation failed.
     """
+    global VLLM_VERSION, CONFIG_FILENAME
+    
+    if VLLM_VERSION is None:
+        import vllm
+        VLLM_VERSION = vllm.__version__
+        CONFIG_FILENAME = f"service_profiling_symbols.{VLLM_VERSION}.yaml"
+    
     config_dir = get_config_dir()
     config_file = config_dir / CONFIG_FILENAME
 
