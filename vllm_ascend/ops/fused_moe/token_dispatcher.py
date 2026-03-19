@@ -161,6 +161,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "moe_expert_num": self.moe_expert_num,
             "global_bs": self.global_bs,
             "expert_token_nums_type": 0,
+            "comm_alg": "ccu",
         }
 
         stage1_kwargs = {
@@ -169,6 +170,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "group_ep": self.moe_all_to_all_group_name,
             "ep_world_size": self.ep_world_size,
             "ep_rank_id": self.ep_rank_id,
+            "comm_alg": "ccu",
         }
         if self.need_extra_args:
             stage1_kwargs.update(
