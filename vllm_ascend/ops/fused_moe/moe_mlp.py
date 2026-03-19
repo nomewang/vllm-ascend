@@ -19,6 +19,7 @@ import torch
 import torch_npu
 from torch.nn.functional import pad
 from vllm.triton_utils import HAS_TRITON
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, swiglustep_and_mul
@@ -326,13 +327,13 @@ def quant_apply_mlp(
 
 
 def apply_moe_activation(
-    activation: str,
+    activation: MoEActivation,
     gate_up_out: torch.Tensor,
 ) -> torch.Tensor:
-    if activation == "silu":
+    if activation == MoEActivation.SILU:
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
-    elif activation == "swiglustep":
+    elif activation == MoEActivation.SWIGLUSTEP:
         gate_up_out = swiglustep_and_mul(gate_up_out, limit=7.0)
 
     else:
@@ -347,7 +348,7 @@ def unquant_apply_mlp(
     group_list: torch.Tensor,
     w1_bias: torch.Tensor = None,
     w2_bias: torch.Tensor = None,
-    activation: str | None = None,
+    activation: MoEActivation | None = None,
     group_list_type: int = 1,
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
@@ -368,7 +369,7 @@ def unquant_apply_mlp(
 
     # apply_moe_activation expects `str`, but `activation` can be None.
     # Default to "silu" to match fused_moe default behavior.
-    act: str = activation or "silu"
+    act: MoEActivation = activation or MoEActivation.SILU
 
     if act == "swigluoai":
         num_experts, _, hidden_size = w1.shape
@@ -398,7 +399,7 @@ def unified_apply_mlp(
     group_list: torch.Tensor,
     w1_scale: list[torch.Tensor] | None = None,
     w2_scale: list[torch.Tensor] | None = None,
-    activation: str | None = None,
+    activation: MoEActivation | None = None,
     w1_bias: torch.Tensor = None,
     w2_bias: torch.Tensor = None,
     dynamic_scale: torch.Tensor = None,
