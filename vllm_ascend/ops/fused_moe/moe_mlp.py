@@ -101,6 +101,7 @@ def quant_apply_mlp(
     w2_offset: torch.Tensor | None = None,
     fusion: bool = False,
     dynamic_eplb: bool = False,
+    activation: MoEActivation | None = None,
     **kwargs,
 ) -> torch.Tensor:
 
@@ -115,6 +116,7 @@ def quant_apply_mlp(
 
     input_hidden_dtype = hidden_states.dtype
     use_gmm_swiglu_quant_fusion = use_mxfp_quant or (fusion and not dynamic_eplb)
+    act: MoEActivation = activation or MoEActivation.SILU
 
     if use_mxfp_quant:
         act_quant_type = kwargs.get("act_quant_type", torch.float8_e4m3fn)
@@ -240,7 +242,8 @@ def quant_apply_mlp(
         )[0]
         dispose_tensor(unquantized_hidden_states)
         # act_fn: swiglu
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
+        # hidden_states = torch_npu.npu_swiglu(hidden_states)
+        hidden_states = apply_moe_activation(act, hidden_states)
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -310,7 +313,8 @@ def quant_apply_mlp(
                     hidden_states, group_list=group_list, group_list_type=group_list_type
                 )
             else:
-                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                # hidden_states = torch_npu.npu_swiglu(hidden_states)
+                hidden_states = apply_moe_activation(act, hidden_states)
                 hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(
@@ -481,4 +485,5 @@ def unified_apply_mlp(
         per_token_scale_type=per_token_scale_type,
         use_mxfp_quant=use_mxfp_quant,
         use_bf16=kwargs.get("use_bf16", True),
+        activation=activation,
     )
