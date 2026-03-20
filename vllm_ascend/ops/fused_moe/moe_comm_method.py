@@ -18,8 +18,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import os
+from typing import Any, Optional, Union
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
+from vllm.model_executor.models.step3p5 import _step3p5_compare_log
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -40,7 +43,7 @@ from vllm_ascend.quantization.methods.base import QuantType
 from vllm_ascend.quantization.quant_parser import parse_mxfp_quant_params
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
-
+_STEP3P5_COMPARE = os.environ.get("VLLM_STEP3P5_COMPARE", "0") == "1"
 
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
     return _MoECommMethods.get(moe_comm_type)
@@ -206,6 +209,9 @@ class MoECommMethod(ABC):
         combine_results = self.token_dispatcher.token_combine(
             hidden_states=mlp_output, context_metadata=dispatch_results.context_metadata
         )
+        if _STEP3P5_COMPARE:
+            _step3p5_compare_log("moe_comm_method.fused_experts.routed_out", combine_results.routed_out, layer_idx='-')
+
 
         return FusedExpertsResult(
             routed_out=combine_results.routed_out,

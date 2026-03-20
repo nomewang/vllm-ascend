@@ -15,7 +15,7 @@
 # This file is a part of the vllm-ascend project.
 
 import os
-from typing import Any, Optional, Unions
+from typing import Any, Optional, Union
 import torch
 import torch_npu
 from torch.nn.functional import pad
