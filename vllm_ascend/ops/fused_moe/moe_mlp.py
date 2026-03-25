@@ -276,7 +276,8 @@ def quant_apply_mlp(
                 group_list=cumsum_group_list(group_list, group_list_type, 0),
                 bias=bias1,
             )
-        elif use_gmm_swiglu_quant_fusion:
+        # elif use_gmm_swiglu_quant_fusion:
+        elif False:
             hidden_states, swiglu_out_scale, _ = DeviceOperator.npu_grouped_matmul_swiglu_quant(
                 x=hidden_states,
                 weight=_require_single_tensor_for_swiglu_quant(w1, name="w1"),
@@ -307,11 +308,13 @@ def quant_apply_mlp(
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
             if HAS_TRITON:
-                from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+            # if False:
+                # from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
 
-                hidden_states, swiglu_out_scale = swiglu_quant(
-                    hidden_states, group_list=group_list, group_list_type=group_list_type
-                )
+                # hidden_states, swiglu_out_scale = swiglu_quant(
+                #     hidden_states, group_list=group_list, group_list_type=group_list_type
+                # )
+                hidden_states, swiglu_out_scale = apply_moe_activation_triton(act, hidden_states, group_list=group_list, group_list_type=group_list_type)
             else:
                 # hidden_states = torch_npu.npu_swiglu(hidden_states)
                 hidden_states = apply_moe_activation(act, hidden_states)
@@ -335,6 +338,30 @@ def quant_apply_mlp(
             fallback_output_dtype=_output_dtype,
         )
     return hidden_states
+
+
+def apply_moe_activation_triton(
+    activation: MoEActivation,
+    hidden_states: torch.Tensor,
+    group_list,
+    group_list_type
+) -> torch.Tensor:
+    if activation == MoEActivation.SILU:
+        from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+        hidden_states, swiglu_out_scale = swiglu_quant(
+            hidden_states, group_list=group_list, group_list_type=group_list_type
+        )
+
+    elif activation == MoEActivation.SWIGLUSTEP:
+        from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+        hidden_states, swiglu_out_scale = swiglu_quant(
+            hidden_states, group_list=group_list, group_list_type=group_list_type, use_step=True, limit=7.0
+        )
+
+
+    else:
+        raise ValueError(f"Unsupported FusedMoE activation: {activation}")
+    return hidden_states, swiglu_out_scale
 
 
 def apply_moe_activation(
