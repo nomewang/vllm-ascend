@@ -597,14 +597,6 @@ class SpecDecodeBaseProposer(EagleProposer):
                 "inputs_embeds": inputs_embeds,
                 "spec_step_idx": spec_step_idx,
             }
-            if self.pass_hidden_states_to_model:
-                model_hidden_states = self.hidden_states[:num_input_tokens]
-                model_hidden_states, model_positions = self.maybe_pad_and_reduce(
-                    model_hidden_states, model_positions
-                )
-                model_kwargs["hidden_states"] = model_hidden_states
-                model_kwargs["positions"] = model_positions
-
             with set_ascend_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -620,6 +612,17 @@ class SpecDecodeBaseProposer(EagleProposer):
                 if forward_context is not None:
                     forward_context.moe_layer_index = 0
 
+                # Keep MTP pre/post-processing in the same forward context as the
+                # model call so SP/shared-expert helpers can read the draft
+                # forward metadata safely.
+                if self.pass_hidden_states_to_model:
+                    model_hidden_states = self.hidden_states[:num_input_tokens]
+                    model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                        model_hidden_states, model_positions
+                    )
+                    model_kwargs["hidden_states"] = model_hidden_states
+                    model_kwargs["positions"] = model_positions
+
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
@@ -627,11 +630,11 @@ class SpecDecodeBaseProposer(EagleProposer):
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
 
-            last_hidden_states, _, hidden_states = self.maybe_all_gather_and_unpad(
-                last_hidden_states,
-                model_positions,
-                hidden_states,
-            )
+                last_hidden_states, _, hidden_states = self.maybe_all_gather_and_unpad(
+                    last_hidden_states,
+                    model_positions,
+                    hidden_states,
+                )
             sample_hidden_states = last_hidden_states[current_token_indices_to_sample]
             logits = self.model.compute_logits(
                 sample_hidden_states,

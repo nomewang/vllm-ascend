@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 import unittest
 
@@ -485,3 +486,81 @@ class TestEagleProposerHelperMethods(TestBase):
         ):
             return_attn, indices = self.proposer.prepare_inputs(mock_attn, num_rejected)
             self.assertEqual(indices.tolist(), [1, 2, 4])
+
+
+class TestEagleProposerMultiLayerMTP(TestBase):
+    def test_propose_multi_layer_mtp_keeps_helper_calls_inside_context(self):
+        proposer = AscendEagleProposer.__new__(AscendEagleProposer)
+        proposer.pcp_size = 1
+        proposer.dcp_size = 1
+        proposer.supports_mm_inputs = False
+        proposer.pass_hidden_states_to_model = True
+        proposer.num_speculative_tokens = 1
+        proposer.method = "mtp"
+        proposer.enable_shared_expert_dp = False
+        proposer.vllm_config = MagicMock()
+        proposer.input_ids = torch.tensor([1, 2], dtype=torch.int32)
+        proposer.hidden_states = torch.randn(2, 4)
+        proposer._get_positions = MagicMock(return_value=torch.tensor([0, 1], dtype=torch.int64))
+        proposer.model_returns_tuple = MagicMock(return_value=False)
+        proposer.model = MagicMock()
+        proposer.model.return_value = proposer.hidden_states[:2]
+        proposer.model.compute_logits.return_value = torch.tensor([[0.1, 0.9]], dtype=torch.float32)
+
+        context_state = {"active": False}
+        call_order: list[str] = []
+
+        @contextmanager
+        def fake_set_context(*args, **kwargs):
+            call_order.append("enter")
+            context_state["active"] = True
+            try:
+                yield
+            finally:
+                context_state["active"] = False
+                call_order.append("exit")
+
+        def fake_maybe_pad_and_reduce(hidden_states, positions):
+            self.assertTrue(context_state["active"])
+            call_order.append("pad")
+            return hidden_states, positions
+
+        def fake_maybe_all_gather_and_unpad(last_hidden_states, positions, hidden_states=None):
+            self.assertTrue(context_state["active"])
+            call_order.append("gather")
+            return last_hidden_states, positions, hidden_states
+
+        proposer.maybe_pad_and_reduce = fake_maybe_pad_and_reduce
+        proposer.maybe_all_gather_and_unpad = fake_maybe_all_gather_and_unpad
+
+        with (
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer.set_ascend_forward_context",
+                new=fake_set_context,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer.get_forward_context",
+                return_value=MagicMock(),
+            ),
+        ):
+            draft_token_ids = proposer._propose_multi_layer_mtp(
+                batch_size=1,
+                num_tokens=2,
+                num_input_tokens=2,
+                token_indices_to_sample=torch.tensor([0], dtype=torch.int64),
+                target_positions=torch.tensor([0, 1], dtype=torch.int64),
+                common_attn_metadata=MagicMock(),
+                num_tokens_across_dp=None,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=None,
+                per_layer_attn_metadata={},
+                mm_embed_inputs=None,
+                req_scheduled_tokens={},
+                long_seq_metadata=None,
+                num_prefill_reqs=0,
+                num_decode_reqs=0,
+                num_rejected_tokens_gpu=None,
+            )
+
+        self.assertEqual(draft_token_ids.tolist(), [[1]])
+        self.assertEqual(call_order, ["enter", "pad", "gather", "exit"])
