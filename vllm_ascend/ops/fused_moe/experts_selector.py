@@ -18,8 +18,10 @@ from collections.abc import Callable
 
 import torch
 
+from vllm.logger import logger
+
+from vllm_ascend.utils import get_weight_prefetch_method, enable_custom_op
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.utils import get_weight_prefetch_method
 
 
 def select_experts(
@@ -74,7 +76,8 @@ def select_experts(
         custom_routing_function=custom_routing_function,
     )
 
-    if is_support_npu_moe_gating_top_k:
+    # if enable_custom_op() and is_support_npu_moe_gating_top_k:
+    if False:
         topk_weights, topk_ids = _select_experts_with_fusion_ops(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -101,6 +104,7 @@ def select_experts(
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
         )
     if mix_placement:
         shared_expert_routing_factor = 1.0 if is_support_npu_moe_gating_top_k else (1 / routed_scaling_factor)
@@ -182,7 +186,7 @@ def _renormalize_topk_weights(
     renormalize: bool,
 ):
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
     return topk_weights
 
 
@@ -266,6 +270,7 @@ def _native_select_experts(
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
     global_num_experts: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Select top-k experts based on router logits.
@@ -290,6 +295,7 @@ def _native_select_experts(
         ValueError: If an unsupported scoring function is provided.
     """
 
+    router_logits = router_logits.float()
     if scoring_func == "softmax":
         topk_weights = router_logits.softmax(dim=-1)
     elif scoring_func == "sigmoid":
@@ -319,12 +325,23 @@ def _native_select_experts(
         topk_ids = topk_ids.to(torch.int32)
         return topk_weights, topk_ids
 
-    topk_weights, topk_ids = topk_weights.topk(top_k, dim=-1)
-    topk_weights = topk_weights.to(hidden_states.dtype)
+    if e_score_correction_bias is not None:
+        # logger.info("No custom_routing_function")
+        gate_prob_with_bias = topk_weights + e_score_correction_bias.unsqueeze(0)
+        _, topk_ids = gate_prob_with_bias.topk(top_k, dim=-1)
+        topk_weights = torch.gather(topk_weights, 1, topk_ids)
+        topk_weights = topk_weights.to(hidden_states.dtype)
 
-    # Required by npu_moe_init_routing
-    topk_ids = topk_ids.to(torch.int32)
-    topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
+        # Required by npu_moe_init_routing
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = _renormalize_topk_weights(topk_weights, True) * routed_scaling_factor
+    else:
+        topk_weights, topk_ids = topk_weights.topk(top_k, dim=-1)
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        # Required by npu_moe_init_routing
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
 
     return topk_weights, topk_ids
 

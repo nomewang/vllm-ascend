@@ -242,6 +242,18 @@ packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
             "up_proj",
         ],
     },
+    "step3p5": {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+        "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+    },
 }
 
 
@@ -524,7 +536,13 @@ class AscendModelSlimConfig(QuantizationConfig):
 
             is_skipped = None
             for shard_prefix in shard_prefixes:
-                is_shard_skipped = self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                weight_key = shard_prefix + ".weight"
+                # If the key is not in quant_description, it means the layer is not
+                # quantized (e.g., MTP layers which are not included in the quant
+                # description file). Treat it as FLOAT (skip quantization).
+                if weight_key not in self.quant_description:
+                    return True
+                is_shard_skipped = self.quant_description[weight_key] == "FLOAT"
 
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
@@ -535,9 +553,17 @@ class AscendModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
+            # Check if any weight key with this prefix exists in quant_description
+            # If no matching key found, the layer is not quantized (e.g., MTP layers)
+            matching_keys = [
+                key for key in self.quant_description
+                if key.startswith(prefix) and key.endswith(".weight")
+            ]
+            if not matching_keys:
+                return True
             is_skipped = any(
-                key.startswith(prefix) and key.endswith(".weight") and value == "FLOAT"
-                for key, value in self.quant_description.items()
+                self.quant_description[key] == "FLOAT"
+                for key in matching_keys
             )
 
         assert is_skipped is not None

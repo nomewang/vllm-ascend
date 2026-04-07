@@ -41,6 +41,8 @@ class AttentionMaskBuilder:
         self.chunked_prefill_attn_mask = None
         self.pcp_mla_mask = None
         self.swa_mask = None
+        self.share_mask_triu_spase = None
+        self.share_mask_tril_spase = None
 
     def get_attn_mask(self, max_seq_len: int, dtype: torch.dtype):
         if self.attn_mask_cache is None or max_seq_len > self._seq_len_cached:
@@ -81,6 +83,13 @@ class AttentionMaskBuilder:
                 tril_mask = torch.tril(mask, -sliding_window).to(self.device)
                 self.swa_mask = triu_mask + tril_mask
         return self.swa_mask
+
+    def get_share_mask_triu_spase(self, dtype: torch.dtype):
+        if self.share_mask_triu_spase is None or self.share_mask_triu_spase.dtype != dtype:
+            mask = torch.ones(2048, 2048, dtype=torch.bool)
+            triu_mask = torch.triu(mask).to(self.device)
+            self.share_mask_triu_spase = triu_mask
+        return self.share_mask_triu_spase
 
     def get_attention_mask(self, model_config: ModelConfig):
         if model_config.runner_type == "pooling":
