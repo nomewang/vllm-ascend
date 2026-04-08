@@ -75,7 +75,10 @@ from vllm.v1.outputs import (
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import (
+    MultiLayerEagleMetadata,
+    SpecDecodeMetadata,
+)
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -210,6 +213,7 @@ class ExecuteModelState(NamedTuple):
     scheduler_output: "SchedulerOutput"
     logits: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
+    multi_layer_eagle_metadata: MultiLayerEagleMetadata | None
     spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
@@ -408,6 +412,10 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config.speculative_config.num_speculative_tokens if self.vllm_config.speculative_config else 0
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            multi_layer_eagle_num=self.multi_layer_eagle_num
+            if self.enable_multi_layer_eagle
+            else 0,
+            hidden_size=self.model_config.get_hidden_size(),
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
@@ -460,6 +468,23 @@ class NPUModelRunner(GPUModelRunner):
         ) = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
+        self.enable_multi_layer_eagle = bool(
+            self.speculative_config
+            and self.speculative_config.method == "mtp"
+            and self.speculative_config.enable_multi_layers_mtp
+        )
+        self.multi_layer_eagle_num = 0
+        if self.enable_multi_layer_eagle and self.speculative_config is not None:
+            draft_hf_config = self.speculative_config.draft_model_config.hf_text_config
+            self.multi_layer_eagle_num = getattr(
+                draft_hf_config,
+                "n_predict",
+                getattr(
+                    self.speculative_config.draft_model_config.hf_config,
+                    "n_predict",
+                    0,
+                ),
+            )
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
@@ -475,6 +500,30 @@ class NPUModelRunner(GPUModelRunner):
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
+
+    def _init_multi_layer_eagle_cache(self, req_state):
+        req_state.cached_len = torch.zeros(1, dtype=torch.int64, device=self.device)
+        req_state.cached_hidden_states = torch.zeros(
+            self.multi_layer_eagle_num,
+            self.model_config.get_hidden_size(),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        req_state.cached_token_ids = torch.zeros(
+            self.multi_layer_eagle_num,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        req_state.cached_positions = torch.zeros(
+            self.multi_layer_eagle_num,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        req_state.cached_slot_mappings = torch.zeros(
+            self.multi_layer_eagle_num,
+            dtype=torch.int64,
+            device=self.device,
+        )
 
     def _use_aclgraph(self) -> bool:
         return (
@@ -612,11 +661,17 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
-    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
+    ) -> tuple[
+        torch.Tensor,
+        SpecDecodeMetadata | None,
+        MultiLayerEagleMetadata | None,
+        int,
+    ]:
         """
         :return: tuple[
             logits_indices,
             spec_decode_metadata,
+            multi_layer_eagle_metadata,
             total_num_scheduled_tokens,
         ]
         """
@@ -908,6 +963,21 @@ class NPUModelRunner(GPUModelRunner):
         # save logits_indices for pcp spec decode usage
         self.logits_indices = logits_indices
 
+        if self.enable_multi_layer_eagle:
+            multi_layer_eagle_metadata = MultiLayerEagleMetadata(
+                cached_len=self.input_batch.cached_len[:base_num_reqs],
+                cached_token_ids=self.input_batch.cached_token_ids[:base_num_reqs],
+                cached_hidden_states=self.input_batch.cached_hidden_states[
+                    :base_num_reqs
+                ],
+                cached_slot_mappings=self.input_batch.cached_slot_mappings[
+                    :base_num_reqs
+                ],
+                cached_positions=self.input_batch.cached_positions[:base_num_reqs],
+            )
+        else:
+            multi_layer_eagle_metadata = None
+
         # Hot-Swap lora model
         if self.lora_config:
             assert np.sum(num_sampled_tokens) <= self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -919,6 +989,7 @@ class NPUModelRunner(GPUModelRunner):
         return (
             logits_indices,
             spec_decode_metadata,
+            multi_layer_eagle_metadata,
             total_num_scheduled_tokens,
         )
 
@@ -1038,6 +1109,7 @@ class NPUModelRunner(GPUModelRunner):
         sampling_metadata: SamplingMetadata,
         scheduler_output: "SchedulerOutput",
         spec_decode_metadata: SpecDecodeMetadata,
+        multi_layer_eagle_metadata: MultiLayerEagleMetadata | None,
         spec_decode_common_attn_metadata: AscendCommonAttentionMetadata,
         positions: torch.Tensor,
         num_scheduled_tokens: int,
@@ -1174,6 +1246,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output=scheduler_output,
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                multi_layer_eagle_metadata=multi_layer_eagle_metadata,
             )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
@@ -1251,6 +1324,7 @@ class NPUModelRunner(GPUModelRunner):
                 (
                     logits_indices,
                     spec_decode_metadata,
+                    multi_layer_eagle_metadata,
                     total_num_scheduled_tokens,
                 ) = self._prepare_inputs(
                     scheduler_output,
@@ -1499,6 +1573,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output,
                 logits,
                 spec_decode_metadata,
+                multi_layer_eagle_metadata,
                 spec_decode_common_attn_metadata,
                 hidden_states,
                 sample_hidden_states,
@@ -1542,6 +1617,7 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output,
             logits,
             spec_decode_metadata,
+            multi_layer_eagle_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
             sample_hidden_states,
@@ -1581,6 +1657,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.sampling_metadata,
                 scheduler_output,
                 spec_decode_metadata,
+                multi_layer_eagle_metadata,
                 spec_decode_common_attn_metadata,
                 positions,
                 scheduler_output.total_num_scheduled_tokens,
@@ -3184,6 +3261,10 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 kernel_block_sizes=self.kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
+                multi_layer_eagle_num=self.multi_layer_eagle_num
+                if self.enable_multi_layer_eagle
+                else 0,
+                hidden_size=self.model_config.get_hidden_size(),
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:

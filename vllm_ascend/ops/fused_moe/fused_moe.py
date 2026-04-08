@@ -18,6 +18,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
 
+import os
+from typing import Any, Optional, Union
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -52,6 +54,8 @@ from vllm_ascend.utils import (
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
 )
+from vllm.model_executor.models.step3p5 import _step3p5_compare_log
+_STEP3P5_COMPARE = os.environ.get("VLLM_STEP3P5_COMPARE", "0") == "1"
 
 
 @dataclass
@@ -129,6 +133,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
+
+        if _STEP3P5_COMPARE:
+            _step3p5_compare_log("select_experts.hs.in", x, layer_idx='-')
+            _step3p5_compare_log("select_experts.router_logits", router_logits, layer_idx='-')
+
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -143,6 +152,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts,
         )
+
+        if _STEP3P5_COMPARE:
+            _step3p5_compare_log("select_experts.out.topk_weights", topk_weights, layer_idx='-')
+            _step3p5_compare_log("select_experts.out.topk_ids", topk_ids, layer_idx='-')
+
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:

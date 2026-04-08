@@ -58,6 +58,9 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 
@@ -203,6 +206,8 @@ class AscendMetadata:
     # sliding window attention mask
     swa_mask: torch.Tensor | None = None
 
+    # bsh_mask: torch.Tensor | None = None
+
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -296,10 +301,24 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         swa_mask = None
         is_swa = hasattr(self.model_config.hf_text_config, "sliding_window")
-        if self.model_config is not None and is_swa:
-            swa_mask = self.attn_mask_builder.get_swa_mask(
-                self.model_config.dtype, self.model_config.hf_text_config.sliding_window
-            )
+        # if self.model_config is not None and is_swa:
+        #     swa_mask = self.attn_mask_builder.get_swa_mask(
+        #         self.model_config.dtype, self.model_config.hf_text_config.sliding_window
+        #     )
+        # bsh_mask = None
+        # if self.model_config is not None and is_swa:
+        #     block_size=128
+        #     max_model_len = block_table.shape[-1] * block_size
+        #     def get_bsh_mask(seq_lens: torch.Tensor, s2: int, left_context=512):
+        #         if seq_lens.dim() == 1:
+        #             seq_lens = seq_lens.unsqueeze(1)
+        #         b = seq_lens.size(0)
+        #         device = seq_lens.device
+        #         indices = torch.arange(s2, device=device).unsqueeze(0).expand(b, -1)
+        #         start_indices = torch.clamp(seq_lens - left_context, min=0)
+        #         mask = (indices < start_indices) | (indices >= seq_lens)
+        #         bsh_mask = mask.unsqueeze(1).to(self.device, non_blocking=True)
+        #     bsh_mask = get_bsh_mask(seq_lens, max_model_len)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -317,6 +336,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             swa_mask=swa_mask,
+            # bsh_mask=bsh_mask,
             attn_state=attn_state,
             num_prefills=num_prefills,
             num_decodes=num_decodes,
@@ -490,6 +510,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_kv_heads,
                         num_heads,
                         scale,
+                        sliding_window,
                         attn_output,
                         softmax_lse,
                     ) = param
@@ -519,7 +540,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_key_value_heads=num_kv_heads,
                         num_heads=num_heads,
                         scale=scale,
-                        sparse_mode=3,
+                        sparse_mode=4 if sliding_window is not None else 3,
+                        pre_tokens=sliding_window - 1 if sliding_window is not None else SWA_INT_MAX,
+                        next_tokens=1 if sliding_window is not None else SWA_INT_MAX,
                         workspace=graph_params.workspaces.get(num_tokens),
                         out=[attn_output, softmax_lse],
                     )
@@ -567,8 +590,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
-                sparse_mode=3,
+                sparse_mode=4 if self.sliding_window is not None else 3,
                 scale=self.scale,
+                pre_tokens=self.sliding_window-1 if self.sliding_window is not None else SWA_INT_MAX,
+                next_tokens=1 if self.sliding_window is not None else SWA_INT_MAX,
             )
             if _EXTRA_CTX.is_draft_model:
                 update_draft_graph_params_workspaces(num_tokens, workspace)
@@ -595,6 +620,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.num_kv_heads,
                 self.num_heads,
                 self.scale,
+                self.sliding_window,
                 weak_ref_tensors(output),
                 weak_ref_tensors(softmax_lse),
             )
@@ -613,8 +639,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv=actual_seq_lengths_kv,
             num_key_value_heads=self.num_kv_heads,
             num_heads=self.num_heads,
+            sparse_mode=4 if self.sliding_window is not None else 3,
             scale=self.scale,
-            sparse_mode=3,
+            pre_tokens=self.sliding_window-1 if self.sliding_window is not None else SWA_INT_MAX,
+            next_tokens=1 if self.sliding_window is not None else SWA_INT_MAX,
             workspace=workspace,
             out=[output, softmax_lse],
         )
@@ -730,29 +758,55 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
     def _forward_fia_slidingwindow(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
-        batch_size = attn_metadata.seq_lens.shape[0]
-        block_size = 128
-        query = query.view(batch_size, 1, self.num_heads * self.head_size)
-        key = self.key_cache
-        value = self.value_cache
-        if self.key_cache is not None and self.value_cache is not None:
-            block_size = self.key_cache.shape[1]
-            key = self.key_cache.flatten(2, 3).contiguous()
-            value = self.value_cache.flatten(2, 3).contiguous()
+        # batch_size = attn_metadata.seq_lens.shape[0]
+        # block_size = 128
+        # query = query.view(batch_size, 1, self.num_heads * self.head_size)
+        # key = self.key_cache
+        # value = self.value_cache
+        # if self.key_cache is not None and self.value_cache is not None:
+        #     block_size = self.key_cache.shape[1]
+        #     key = self.key_cache.flatten(2, 3).contiguous()
+        #     value = self.value_cache.flatten(2, 3).contiguous()
 
+        # attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+        #     query,
+        #     key,
+        #     value,
+        #     num_heads=self.num_heads,
+        #     num_key_value_heads=self.num_kv_heads,
+        #     input_layout="BSH",
+        #     block_size=block_size,
+        #     atten_mask=attn_metadata.bsh_mask,
+        #     sparse_mode=0,
+        #     scale=self.scale,
+        #     block_table=attn_metadata.block_tables,
+        #     actual_seq_lengths=[1] * len(attn_metadata.seq_lens),
+        #     actual_seq_lengths_kv=attn_metadata.seq_lens,
+        # )
+
+        # print(f"=======================rank {torch.distributed.get_rank()} attn_metadata.actual_seq_lengths_q {attn_metadata.actual_seq_lengths_q}")
+        # print(f"=======================rank {torch.distributed.get_rank()} attn_metadata.seq_lens_list {attn_metadata.seq_lens_list}")
+        #TND
+        batch_size = attn_metadata.seq_lens.shape[0]
+        num_block, block_size, _, _ = self.key_cache.shape
+        key = self.key_cache.view(num_block, block_size, -1)
+        value = self.value_cache.view(num_block, block_size, -1)
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query,
             key,
             value,
             num_heads=self.num_heads,
             num_key_value_heads=self.num_kv_heads,
-            input_layout="BSH",
+            input_layout="TND",
+            pre_tokens=self.sliding_window-1,
+            next_tokens=1,
             block_size=block_size,
-            pre_tokens=self.sliding_window,
+            atten_mask=attn_metadata.attn_mask,
+            sparse_mode=4,
             scale=self.scale,
             block_table=attn_metadata.block_tables,
-            actual_seq_lengths=[1] * len(attn_metadata.seq_lens),
-            actual_seq_lengths_kv=attn_metadata.seq_lens,
+            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
         )
 
         attn_output = attn_output.view(batch_size, self.num_heads, self.head_size)
@@ -820,10 +874,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 learnable_sink=self.sinks,
             )
         else:
+            # print(f"=======================rank {torch.distributed.get_rank()} attn_metadata.actual_seq_lengths_q {attn_metadata.actual_seq_lengths_q}")
+            # print(f"=======================rank {torch.distributed.get_rank()} actual_seq_lengths_kv {actual_seq_lengths_kv}")
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                 query=query,
                 key=key,
                 value=value,
+                pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+                next_tokens=0 if self.sliding_window is not None else SWA_INT_MAX,
                 atten_mask=attn_metadata.attn_mask,
                 block_table=block_table,
                 input_layout="TND",
@@ -833,7 +891,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 scale=self.scale,
-                sparse_mode=3,
+                sparse_mode=4 if self.sliding_window is not None else 3,
             )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
@@ -896,6 +954,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
+            # logger.info(f"=======================rank {torch.distributd.get_rank()} attn_metadata.slot_mapping {attn_metadata.slot_mapping.cpu().tolist()}")
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,

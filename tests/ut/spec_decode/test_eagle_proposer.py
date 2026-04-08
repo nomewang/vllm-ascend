@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 import unittest
 import pytest
@@ -574,7 +575,7 @@ class TestEagleProposerPropose():
         'graph_pad_size, num_input_tokens, prefill_context_parallel_metadata',
         [
             (
-                "prefill", torch.tensor([ 0, 13], device=torch.device("cpu"), dtype=torch.int32), torch.tensor([ 0, 13], dtype=torch.int32), 
+                "prefill", torch.tensor([ 0, 13], device=torch.device("cpu"), dtype=torch.int32), torch.tensor([ 0, 13], dtype=torch.int32),
                 torch.tensor([13], device=torch.device("cpu"), dtype=torch.int32), 1, 13, 13, 13,
                 torch.eye(256, device=torch.device("cpu"), dtype=torch.int32)[0].unsqueeze(0),
                 torch.tensor([128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140], device=torch.device("cpu"), dtype=torch.int32),
@@ -583,7 +584,7 @@ class TestEagleProposerPropose():
                 AscendAttentionState.PrefillNoCache, -1, 13, None
             ),
             (
-                "decode", torch.tensor([ 0, 4, 8, 12], device=torch.device("cpu"), dtype=torch.int32), torch.tensor([ 0, 4, 8, 12], dtype=torch.int32), 
+                "decode", torch.tensor([ 0, 4, 8, 12], device=torch.device("cpu"), dtype=torch.int32), torch.tensor([ 0, 4, 8, 12], dtype=torch.int32),
                 torch.tensor([21, 17, 17], device=torch.device("cpu"), dtype=torch.int32), 3, 12, 4, 0,
                 torch.cat([torch.eye(256, device="cpu", dtype=torch.int32)[0].unsqueeze(0)*i for i in [1,2,3]], dim=0),
                 torch.tensor([145, 146, 147, 148, 269, 270, 271, 272, 397, 398, 399, 400], device=torch.device("cpu"), dtype=torch.int32),
@@ -645,7 +646,7 @@ class TestEagleProposerPropose():
                                         decode_token_per_req, actual_seq_lengths_q, positions, attn_state,
                                         graph_pad_size, num_input_tokens, prefill_context_parallel_metadata
                                         )
-        
+
         # create other parameters
         if not self.is_decode(flag_prefill_decode):
             target_token_ids = torch.tensor([151644, 872, 198, 5501, 7512, 14678, 51765, 30, 151645, 198, 151644, 77091, 198], device=self.device, dtype=torch.int32)
@@ -788,3 +789,81 @@ class TestEagleProposerPropose():
             return True
         if flag_prefill_decode == "prefill":
             return False
+
+
+class TestEagleProposerMultiLayerMTP(TestBase):
+    def test_propose_multi_layer_mtp_keeps_helper_calls_inside_context(self):
+        proposer = AscendEagleProposer.__new__(AscendEagleProposer)
+        proposer.pcp_size = 1
+        proposer.dcp_size = 1
+        proposer.supports_mm_inputs = False
+        proposer.pass_hidden_states_to_model = True
+        proposer.num_speculative_tokens = 1
+        proposer.method = "mtp"
+        proposer.enable_shared_expert_dp = False
+        proposer.vllm_config = MagicMock()
+        proposer.input_ids = torch.tensor([1, 2], dtype=torch.int32)
+        proposer.hidden_states = torch.randn(2, 4)
+        proposer._get_positions = MagicMock(return_value=torch.tensor([0, 1], dtype=torch.int64))
+        proposer.model_returns_tuple = MagicMock(return_value=False)
+        proposer.model = MagicMock()
+        proposer.model.return_value = proposer.hidden_states[:2]
+        proposer.model.compute_logits.return_value = torch.tensor([[0.1, 0.9]], dtype=torch.float32)
+
+        context_state = {"active": False}
+        call_order: list[str] = []
+
+        @contextmanager
+        def fake_set_context(*args, **kwargs):
+            call_order.append("enter")
+            context_state["active"] = True
+            try:
+                yield
+            finally:
+                context_state["active"] = False
+                call_order.append("exit")
+
+        def fake_maybe_pad_and_reduce(hidden_states, positions):
+            self.assertTrue(context_state["active"])
+            call_order.append("pad")
+            return hidden_states, positions
+
+        def fake_maybe_all_gather_and_unpad(last_hidden_states, positions, hidden_states=None):
+            self.assertTrue(context_state["active"])
+            call_order.append("gather")
+            return last_hidden_states, positions, hidden_states
+
+        proposer.maybe_pad_and_reduce = fake_maybe_pad_and_reduce
+        proposer.maybe_all_gather_and_unpad = fake_maybe_all_gather_and_unpad
+
+        with (
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer.set_ascend_forward_context",
+                new=fake_set_context,
+            ),
+            patch(
+                "vllm_ascend.spec_decode.eagle_proposer.get_forward_context",
+                return_value=MagicMock(),
+            ),
+        ):
+            draft_token_ids = proposer._propose_multi_layer_mtp(
+                batch_size=1,
+                num_tokens=2,
+                num_input_tokens=2,
+                token_indices_to_sample=torch.tensor([0], dtype=torch.int64),
+                target_positions=torch.tensor([0, 1], dtype=torch.int64),
+                common_attn_metadata=MagicMock(),
+                num_tokens_across_dp=None,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=None,
+                per_layer_attn_metadata={},
+                mm_embed_inputs=None,
+                req_scheduled_tokens={},
+                long_seq_metadata=None,
+                num_prefill_reqs=0,
+                num_decode_reqs=0,
+                num_rejected_tokens_gpu=None,
+            )
+
+        self.assertEqual(draft_token_ids.tolist(), [[1]])
+        self.assertEqual(call_order, ["enter", "pad", "gather", "exit"])
