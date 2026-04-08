@@ -322,7 +322,6 @@ def _native_select_experts(
         topk_ids = topk_ids.to(torch.int32)
         return topk_weights, topk_ids
 
-    # logger.info("No custom_routing_function")
     gate_prob_with_bias = topk_weights + e_score_correction_bias.unsqueeze(0)
     _, topk_ids = gate_prob_with_bias.topk(top_k, dim=-1)
     topk_weights = torch.gather(topk_weights, 1, topk_ids)

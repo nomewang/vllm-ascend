@@ -437,7 +437,6 @@ def unquant_apply_mlp(
         group_list=group_list,
     )[0]
 
-    # debug hidden_states
     if _STEP3P5_COMPARE:
         _step3p5_compare_log("unquant_apply_mlp.post_gmm.hs", hidden_states, layer_idx='-')
     return hidden_states
