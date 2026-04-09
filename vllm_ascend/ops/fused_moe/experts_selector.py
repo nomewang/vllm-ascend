@@ -21,7 +21,7 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.utils import get_weight_prefetch_method, enable_custom_op
+from vllm_ascend.utils import get_weight_prefetch_method
 
 
 def select_experts(
