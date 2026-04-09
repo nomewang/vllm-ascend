@@ -150,7 +150,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         else:
             self.tp_group_context = nullcontext()
 
-self.use_cuda_graph = (
+        self.use_cuda_graph = (
             self.runner._use_aclgraph()
             and not self.speculative_config.enforce_eager
             and self.pcp_size * self.dcp_size == 1
