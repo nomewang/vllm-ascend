@@ -14,14 +14,12 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-import os
 from typing import Any, Optional, Union
 import torch
 import torch_npu
 from torch.nn.functional import pad
 from vllm.triton_utils import HAS_TRITON
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.models.step3p5 import _step3p5_compare_log
 
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, swiglustep_and_mul
@@ -38,7 +36,6 @@ from vllm_ascend.utils import (
     get_weight_prefetch_method,
 )
 
-_STEP3P5_COMPARE = os.environ.get("VLLM_STEP3P5_COMPARE", "0") == "1"
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -396,9 +393,6 @@ def unquant_apply_mlp(
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
 
-    if _STEP3P5_COMPARE:
-        _step3p5_compare_log("unquant_apply_mlp.gmm.hs.in", hidden_states, layer_idx='-')
-
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
         weight=[w1],
@@ -408,9 +402,6 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
-    if _STEP3P5_COMPARE:
-        _step3p5_compare_log("unquant_apply_mlp.post_gmm.gate_up_out", gate_up_out, layer_idx='-')
-
 
     # apply_moe_activation expects `str`, but `activation` can be None.
     # Default to "silu" to match fused_moe default behavior.
@@ -425,8 +416,6 @@ def unquant_apply_mlp(
     if topk_scales is not None:
         gate_up_out *= topk_scales
 
-    if _STEP3P5_COMPARE:
-        _step3p5_compare_log("unquant_apply_mlp.post_act.gate_up_out", gate_up_out, layer_idx='-')
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[gate_up_out],
         weight=[w2],
@@ -437,8 +426,6 @@ def unquant_apply_mlp(
         group_list=group_list,
     )[0]
 
-    if _STEP3P5_COMPARE:
-        _step3p5_compare_log("unquant_apply_mlp.post_gmm.hs", hidden_states, layer_idx='-')
     return hidden_states
 
 
