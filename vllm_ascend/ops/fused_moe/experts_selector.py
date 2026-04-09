@@ -76,8 +76,7 @@ def select_experts(
         custom_routing_function=custom_routing_function,
     )
 
-    # if enable_custom_op() and is_support_npu_moe_gating_top_k:
-    if False:
+    if enable_custom_op() and is_support_npu_moe_gating_top_k:
         topk_weights, topk_ids = _select_experts_with_fusion_ops(
             hidden_states=hidden_states,
             router_logits=router_logits,
