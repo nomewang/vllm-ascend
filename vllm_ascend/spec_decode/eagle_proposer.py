@@ -384,49 +384,17 @@ class SpecDecodeBaseProposer(EagleProposer):
         common_attn_metadata: CommonAttentionMetadata,
         batch_size: int,
     ) -> None:
-        if (
-            hasattr(common_attn_metadata, "seq_lens_cpu")
-            and common_attn_metadata.seq_lens_cpu is not None
-        ):
-            common_attn_metadata.seq_lens_cpu[:batch_size].copy_(
-                common_attn_metadata.seq_lens[:batch_size].to(
-                    device="cpu",
-                    dtype=common_attn_metadata.seq_lens_cpu.dtype,
-                ),
-                non_blocking=False,
-            )
-
-        if (
-            hasattr(common_attn_metadata, "num_computed_tokens_cpu")
-            and common_attn_metadata.num_computed_tokens_cpu is not None
-        ):
-            query_lens_cpu = (
-                common_attn_metadata.query_start_loc_cpu[1 : batch_size + 1]
-                - common_attn_metadata.query_start_loc_cpu[:batch_size]
-            )
-            num_computed_tokens_cpu = common_attn_metadata.seq_lens[
-                :batch_size
-            ].to(device="cpu", dtype=common_attn_metadata.num_computed_tokens_cpu.dtype)
-            num_computed_tokens_cpu -= query_lens_cpu.to(
-                common_attn_metadata.num_computed_tokens_cpu.dtype
-            )
-            common_attn_metadata.num_computed_tokens_cpu[:batch_size].copy_(
-                num_computed_tokens_cpu,
-                non_blocking=False,
-            )
+        # In the new framework, seq_lens_cpu and num_computed_tokens_cpu are
+        # deprecated. Use seq_lens directly and compute values on device.
+        # The upstream CommonAttentionMetadata provides deprecated properties
+        # that compute seq_lens_cpu and num_computed_tokens_cpu on-the-fly
+        # from seq_lens, so we don't need to maintain separate CPU copies here.
 
         if batch_size > 0:
-            if (
-                hasattr(common_attn_metadata, "seq_lens_cpu")
-                and common_attn_metadata.seq_lens_cpu is not None
-            ):
-                common_attn_metadata.max_seq_len = int(
-                    common_attn_metadata.seq_lens_cpu[:batch_size].max().item()
-                )
-            else:
-                common_attn_metadata.max_seq_len = int(
-                    common_attn_metadata.seq_lens[:batch_size].max().item()
-                )
+            # Compute max_seq_len directly from seq_lens on device
+            common_attn_metadata.max_seq_len = int(
+                common_attn_metadata.seq_lens[:batch_size].max().item()
+            )
 
     def adjust_input(
         self,

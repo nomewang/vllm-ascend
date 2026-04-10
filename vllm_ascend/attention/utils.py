@@ -134,13 +134,21 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     AttentionMetadataBuilder instances use it to construct per-layer metadata.
 
     For many of the tensors we keep both NPU and CPU versions.
+
+    Note: seq_lens_cpu and num_computed_tokens_cpu are deprecated in the upstream
+    CommonAttentionMetadata (they use private fields _seq_lens_cpu and _num_computed_tokens_cpu
+    with property getters). Ascend still needs these as explicit fields for NPU-specific
+    operations and backward compatibility with existing code that passes them to constructors.
+    Use seq_lens directly whenever possible to avoid CPU-NPU sync.
     """
 
     # CPU tensor of sequence lengths for host-side operations.
+    # Note: This is deprecated in upstream but still needed for Ascend operations.
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None
 
     # CPU tensor of already computed tokens count per request.
+    # Note: This is deprecated in upstream but still needed for Ascend operations.
     # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
     num_computed_tokens_cpu: torch.Tensor = None
 
@@ -175,8 +183,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
-            seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs],
-            num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs],
+            seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs] if self.seq_lens_cpu is not None else None,
+            num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs] if self.num_computed_tokens_cpu is not None else None,
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,
