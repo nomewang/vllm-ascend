@@ -113,7 +113,9 @@ def rejection_sample(
     # When num_speculative_tokens>=3, using block verify.
     # Skip block verify when draft_probs is None (suffix/ngram methods)
     # to avoid incorrect verification results.
-    using_block_verify = max_spec_len >= 3 and draft_probs is not None
+    # Skip block verify when enable_multi_layers_mtp is True.
+    enable_multi_layers_mtp = getattr(sampling_metadata, 'enable_multi_layers_mtp', False)
+    using_block_verify = max_spec_len >= 3 and draft_probs is not None and not enable_multi_layers_mtp
 
     # Create output buffer.
     output_token_ids = torch.empty(

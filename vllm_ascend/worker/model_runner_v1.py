@@ -1775,6 +1775,8 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+        # Pass enable_multi_layers_mtp via sampling_metadata for rejection_sample
+        sampling_metadata.enable_multi_layers_mtp = self.enable_multi_layer_eagle
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
