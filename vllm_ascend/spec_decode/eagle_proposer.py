@@ -31,7 +31,10 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.metadata import (
+    MultiLayerEagleMetadata,
+    SpecDecodeMetadata,
+)
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
@@ -97,6 +100,18 @@ class SpecDecodeBaseProposer(EagleProposer):
         self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self.decode_threshold = 1 + self.num_speculative_tokens
+        self.enable_multi_layers_mtp = bool(
+            self.method == "mtp" and self.speculative_config.enable_multi_layers_mtp
+        )
+        self.layer_num = (
+            getattr(
+                self.speculative_config.draft_model_config.hf_text_config,
+                "n_predict",
+                self.num_speculative_tokens,
+            )
+            if self.enable_multi_layers_mtp
+            else 1
+        )
         self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
         self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
@@ -140,6 +155,18 @@ class SpecDecodeBaseProposer(EagleProposer):
             and not self.speculative_config.enforce_eager
             and self.pcp_size * self.dcp_size == 1
         )
+        if self.method == "mtp":
+            self.use_cuda_graph = (
+                self.use_cuda_graph
+                and not self.use_async_scheduling
+                and not self.speculative_config.disable_padded_drafter_batch
+            )
+        if self.enable_multi_layers_mtp:
+            self.use_cuda_graph = False
+            if self.speculative_config.disable_padded_drafter_batch:
+                raise NotImplementedError(
+                    "Multi-layer MTP on Ascend requires padded drafter batch."
+                )
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()
@@ -326,8 +353,16 @@ class SpecDecodeBaseProposer(EagleProposer):
 
         if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
             for _, layer_module in self.model.model.layers.items():
-                if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
-                    layer_module.shared_head.head = model.lm_head
+                shared_lm_head = getattr(
+                    layer_module,
+                    "lm_head",
+                    getattr(layer_module, "shared_head", None),
+                )
+                if (
+                    shared_lm_head is not None
+                    and torch.equal(shared_lm_head.head.weight, model.lm_head.weight)
+                ):
+                    shared_lm_head.head = model.lm_head
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
@@ -343,6 +378,281 @@ class SpecDecodeBaseProposer(EagleProposer):
         # Currently, new objects will be assigned to the lists in attn_metadata
         # when update. So we can use the shallow copy.
         return copy.copy(attn_metadata)
+
+    def _refresh_multi_layer_metadata_views(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        batch_size: int,
+    ) -> None:
+        # In the new framework, seq_lens_cpu and num_computed_tokens_cpu are
+        # deprecated. Use seq_lens directly and compute values on device.
+        # The upstream CommonAttentionMetadata provides deprecated properties
+        # that compute seq_lens_cpu and num_computed_tokens_cpu on-the-fly
+        # from seq_lens, so we don't need to maintain separate CPU copies here.
+
+        if batch_size > 0:
+            # Compute max_seq_len directly from seq_lens on device
+            common_attn_metadata.max_seq_len = int(
+                common_attn_metadata.seq_lens[:batch_size].max().item()
+            )
+
+    def adjust_input(
+        self,
+        batch_size: int,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        multi_layer_eagle_metadata: MultiLayerEagleMetadata | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, CommonAttentionMetadata]:
+        if not self.enable_multi_layers_mtp:
+            return (
+                target_token_ids,
+                target_positions,
+                target_hidden_states,
+                common_attn_metadata,
+            )
+
+        if target_positions.dim() != 1:
+            raise NotImplementedError(
+                "Multi-layer MTP on Ascend currently supports 1D positions only."
+            )
+        if multi_layer_eagle_metadata is None:
+            raise ValueError("multi_layer_eagle_metadata is required for multi-layer MTP.")
+
+        if token_indices_to_sample is None:
+            token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1
+
+        assert multi_layer_eagle_metadata.cached_len is not None
+        assert multi_layer_eagle_metadata.cached_token_ids is not None
+        assert multi_layer_eagle_metadata.cached_hidden_states is not None
+        assert multi_layer_eagle_metadata.cached_slot_mappings is not None
+        assert multi_layer_eagle_metadata.cached_positions is not None
+
+        prev_token_ids = target_token_ids.clone()
+        prev_positions = target_positions.clone()
+        prev_hidden_states = target_hidden_states.clone()
+        prev_slot_mapping = common_attn_metadata.slot_mapping.clone()
+
+        start_token_indices = common_attn_metadata.query_start_loc[:-1]
+        end_token_indices = common_attn_metadata.query_start_loc[1:] - 1
+        start_token_pos = target_positions[start_token_indices]
+
+        raw_shift = torch.minimum(
+            end_token_indices - token_indices_to_sample,
+            start_token_pos,
+        )
+        raw_shift = torch.clamp(raw_shift, min=0)
+
+        token_indices_to_sample.add_(raw_shift)
+        common_attn_metadata.seq_lens[:batch_size].sub_(
+            raw_shift.to(common_attn_metadata.seq_lens.dtype)
+        )
+        self._refresh_multi_layer_metadata_views(common_attn_metadata, batch_size)
+
+        cached_lens = multi_layer_eagle_metadata.cached_len[:batch_size]
+        shift = torch.minimum(
+            raw_shift.to(dtype=cached_lens.dtype),
+            cached_lens,
+        ).to(dtype=torch.int64)
+
+        cached_token_ids = multi_layer_eagle_metadata.cached_token_ids[:batch_size]
+        cached_hidden_states = multi_layer_eagle_metadata.cached_hidden_states[
+            :batch_size
+        ]
+        cached_slot_mappings = multi_layer_eagle_metadata.cached_slot_mappings[
+            :batch_size
+        ]
+        cached_positions = multi_layer_eagle_metadata.cached_positions[:batch_size]
+
+        for req_idx in range(batch_size):
+            start = int(start_token_indices[req_idx].item())
+            end = int(end_token_indices[req_idx].item())
+            req_shift = int(shift[req_idx].item())
+            cached_len = int(cached_lens[req_idx].item())
+
+            if req_shift > 0:
+                cache_start = cached_len - req_shift
+                prev_token_ids[start : start + req_shift] = cached_token_ids[
+                    req_idx, cache_start:cached_len
+                ].to(dtype=prev_token_ids.dtype)
+                prev_positions[start : start + req_shift] = cached_positions[
+                    req_idx, cache_start:cached_len
+                ].to(dtype=prev_positions.dtype)
+                prev_hidden_states[start : start + req_shift] = cached_hidden_states[
+                    req_idx, cache_start:cached_len
+                ].to(dtype=prev_hidden_states.dtype)
+                prev_slot_mapping[start : start + req_shift] = cached_slot_mappings[
+                    req_idx, cache_start:cached_len
+                ].to(dtype=prev_slot_mapping.dtype)
+
+            if end + 1 > start + req_shift:
+                prev_token_ids[start + req_shift : end + 1] = target_token_ids[
+                    start : end + 1 - req_shift
+                ]
+                prev_positions[start + req_shift : end + 1] = target_positions[
+                    start : end + 1 - req_shift
+                ]
+                prev_hidden_states[start + req_shift : end + 1] = target_hidden_states[
+                    start : end + 1 - req_shift
+                ]
+                prev_slot_mapping[start + req_shift : end + 1] = (
+                    common_attn_metadata.slot_mapping[start : end + 1 - req_shift]
+                )
+
+            sample_idx = int(token_indices_to_sample[req_idx].item())
+            store_start = max(start, sample_idx + 1 - self.layer_num)
+            store_len = max(0, min(self.layer_num, sample_idx - store_start + 1))
+
+            cached_lens[req_idx] = store_len
+            cached_token_ids[req_idx].zero_()
+            cached_hidden_states[req_idx].zero_()
+            cached_slot_mappings[req_idx].zero_()
+            cached_positions[req_idx].zero_()
+            if store_len > 0:
+                store_slice = slice(store_start, sample_idx + 1)
+                cached_token_ids[req_idx, :store_len] = prev_token_ids[store_slice].to(
+                    dtype=cached_token_ids.dtype
+                )
+                cached_hidden_states[req_idx, :store_len] = prev_hidden_states[
+                    store_slice
+                ].to(dtype=cached_hidden_states.dtype)
+                cached_slot_mappings[req_idx, :store_len] = prev_slot_mapping[
+                    store_slice
+                ].to(dtype=cached_slot_mappings.dtype)
+                cached_positions[req_idx, :store_len] = prev_positions[store_slice].to(
+                    dtype=cached_positions.dtype
+                )
+
+        common_attn_metadata.slot_mapping = prev_slot_mapping
+        return (
+            prev_token_ids,
+            prev_positions,
+            prev_hidden_states,
+            common_attn_metadata,
+        )
+
+    def _propose_multi_layer_mtp(
+        self,
+        batch_size: int,
+        num_tokens: int,
+        num_input_tokens: int,
+        token_indices_to_sample: torch.Tensor,
+        target_positions: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_tokens_across_dp: torch.Tensor | None,
+        aclgraph_runtime_mode: CUDAGraphMode,
+        batch_descriptor,
+        per_layer_attn_metadata: dict[str, Any],
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        req_scheduled_tokens,
+        long_seq_metadata,
+        num_prefill_reqs: int,
+        num_decode_reqs: int,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.pcp_size * self.dcp_size > 1:
+            raise NotImplementedError(
+                "Multi-layer MTP on Ascend does not support PCP/DCP yet."
+            )
+
+        draft_token_ids_list: list[torch.Tensor] = []
+        current_num_tokens = num_tokens
+        current_token_indices_to_sample = token_indices_to_sample
+
+        for spec_step_idx in range(self.num_speculative_tokens):
+            if self.supports_mm_inputs:
+                mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+                self.inputs_embeds[:current_num_tokens] = self.model.embed_input_ids(
+                    self.input_ids[:current_num_tokens],
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
+                model_input_ids = self.input_ids[:num_input_tokens]
+                inputs_embeds = self.inputs_embeds[:num_input_tokens]
+            else:
+                model_input_ids = self.input_ids[:num_input_tokens]
+                inputs_embeds = None
+
+            model_positions = self._get_positions(num_input_tokens)
+            model_kwargs = {
+                "input_ids": model_input_ids,
+                "positions": model_positions,
+                "inputs_embeds": inputs_embeds,
+                "spec_step_idx": spec_step_idx,
+            }
+            with set_ascend_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                num_actual_tokens=current_num_tokens,
+                batch_descriptor=batch_descriptor,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                is_draft_model=True,
+                draft_attn_metadatas=[per_layer_attn_metadata],
+            ):
+                forward_context = get_forward_context()
+                if forward_context is not None:
+                    forward_context.moe_layer_index = 0
+
+                # Keep MTP pre/post-processing in the same forward context as the
+                # model call so SP/shared-expert helpers can read the draft
+                # forward metadata safely.
+                if self.pass_hidden_states_to_model:
+                    model_hidden_states = self.hidden_states[:num_input_tokens]
+                    model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                        model_hidden_states, model_positions
+                    )
+                    model_kwargs["hidden_states"] = model_hidden_states
+                    model_kwargs["positions"] = model_positions
+
+                ret_hidden_states = self.model(**model_kwargs)
+                if not self.model_returns_tuple():
+                    last_hidden_states = ret_hidden_states
+                    hidden_states = last_hidden_states
+                else:
+                    last_hidden_states, hidden_states = ret_hidden_states
+
+                last_hidden_states, _, hidden_states = self.maybe_all_gather_and_unpad(
+                    last_hidden_states,
+                    model_positions,
+                    hidden_states,
+                )
+            sample_hidden_states = last_hidden_states[current_token_indices_to_sample]
+            logits = self.model.compute_logits(
+                sample_hidden_states,
+                spec_step_idx=spec_step_idx,
+            )
+            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids_list.append(draft_token_ids)
+
+            if spec_step_idx >= self.num_speculative_tokens - 1:
+                continue
+
+            prev_token_ids = self.input_ids[:current_num_tokens].clone()
+            hidden_states = hidden_states[:current_num_tokens]
+            (
+                current_num_tokens,
+                current_token_indices_to_sample,
+                common_attn_metadata,
+                _,
+            ) = self.set_inputs_first_pass(
+                target_token_ids=prev_token_ids,
+                next_token_ids=draft_token_ids.int(),
+                target_positions=target_positions,
+                target_hidden_states=hidden_states,
+                token_indices_to_sample=current_token_indices_to_sample,
+                cad=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                req_scheduled_tokens=req_scheduled_tokens,
+                long_seq_metadata=long_seq_metadata,
+                num_prefill_reqs=num_prefill_reqs,
+                num_decode_reqs=num_decode_reqs,
+            )
+
+        return torch.stack(draft_token_ids_list, dim=1)
 
     @torch.inference_mode()
     def dummy_run(
@@ -487,6 +797,7 @@ class SpecDecodeBaseProposer(EagleProposer):
         scheduler_output: SchedulerOutput = None,
         num_scheduled_tokens: int = 0,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
+        multi_layer_eagle_metadata: MultiLayerEagleMetadata | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
 
@@ -497,6 +808,22 @@ class SpecDecodeBaseProposer(EagleProposer):
             assert isinstance(self.get_model(), Eagle3LlamaForCausalLM)
             target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
+
+        if self.enable_multi_layers_mtp:
+            (
+                target_token_ids,
+                target_positions,
+                target_hidden_states,
+                common_attn_metadata,
+            ) = self.adjust_input(
+                batch_size=batch_size,
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                multi_layer_eagle_metadata=multi_layer_eagle_metadata,
+            )
 
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,
@@ -608,15 +935,34 @@ class SpecDecodeBaseProposer(EagleProposer):
         assert len(self.draft_attn_groups) > 0
         builder = self.draft_attn_groups[0].get_metadata_builder()
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
+        per_layer_attn_metadata = {
+            layer_name: attn_metadata for layer_name in self.attn_layer_names
+        }
+
+        if self.enable_multi_layers_mtp:
+            return self._propose_multi_layer_mtp(
+                batch_size=batch_size,
+                num_tokens=num_tokens,
+                num_input_tokens=num_input_tokens,
+                token_indices_to_sample=token_indices_to_sample,
+                target_positions=target_positions,
+                common_attn_metadata=common_attn_metadata,
+                num_tokens_across_dp=num_tokens_across_dp,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                per_layer_attn_metadata=per_layer_attn_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                req_scheduled_tokens=req_scheduled_tokens,
+                long_seq_metadata=long_seq_metadata,
+                num_prefill_reqs=num_prefill_reqs,
+                num_decode_reqs=num_decode_reqs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
 
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
-        per_layer_attn_metadata = dict()
-        # The first step of speculative.
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
         multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         # Copy the old attn_metadata and update

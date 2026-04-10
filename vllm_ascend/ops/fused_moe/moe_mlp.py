@@ -14,12 +14,15 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-
+from typing import Any, Optional, Union
 import torch
 import torch_npu
 from torch.nn.functional import pad
 from vllm.triton_utils import HAS_TRITON
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
+from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, swiglustep_and_mul
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import (
@@ -32,6 +35,7 @@ from vllm_ascend.utils import (
     enable_custom_op,
     get_weight_prefetch_method,
 )
+
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -101,9 +105,16 @@ def quant_apply_mlp(
     scale_type: torch.dtype | None = None,
     per_token_scale_type: torch.dtype | None = None,
     use_bf16: bool = True,
+    activation: MoEActivation | None = None,
+    **kwargs,
 ) -> torch.Tensor:
+
+    # TODO(linfeng): Current massive parameter passing is quite severe; parameter differences introduced by different
+    # quantization modes will be consolidated into a dataclass in a follow-up.
+
     input_hidden_dtype = hidden_states.dtype
     use_gmm_swiglu_quant_fusion = use_mxfp_quant or (fusion and not dynamic_eplb)
+    act: MoEActivation = activation or MoEActivation.SILU
 
     if use_mxfp_quant:
         ensure_mxfp8_moe_available("MXFP MoE MLP path")
@@ -127,6 +138,8 @@ def quant_apply_mlp(
         dispose_tensor(unquantized_hidden_states)
         quantized_hidden_states = None
     else:
+        if use_mxfp_quant and dynamic_scale.ndim == 2:
+            dynamic_scale = dynamic_scale.reshape(dynamic_scale.shape[0], dynamic_scale.shape[1] // 2, 2)
         unquantized_hidden_states = None
         pertoken_scale = (
             DeviceOperator.maybe_normalize_mxfp_scale_layout(dynamic_scale) if use_mxfp_quant else dynamic_scale
@@ -225,7 +238,8 @@ def quant_apply_mlp(
         )[0]
         dispose_tensor(unquantized_hidden_states)
         # act_fn: swiglu
-        hidden_states = torch_npu.npu_swiglu(hidden_states)
+        # hidden_states = torch_npu.npu_swiglu(hidden_states)
+        hidden_states = apply_moe_activation(act, hidden_states)
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -258,7 +272,8 @@ def quant_apply_mlp(
                 group_list=cumsum_group_list(group_list, group_list_type, 0),
                 bias=bias1,
             )
-        elif use_gmm_swiglu_quant_fusion:
+        # elif use_gmm_swiglu_quant_fusion:
+        elif False:
             hidden_states, swiglu_out_scale, _ = DeviceOperator.npu_grouped_matmul_swiglu_quant(
                 x=hidden_states,
                 weight=_require_single_tensor_for_swiglu_quant(w1, name="w1"),
@@ -291,13 +306,16 @@ def quant_apply_mlp(
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
             if HAS_TRITON:
-                from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+            # if False:
+                # from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
 
-                hidden_states, swiglu_out_scale = swiglu_quant(
-                    hidden_states, group_list=group_list, group_list_type=group_list_type
-                )
+                # hidden_states, swiglu_out_scale = swiglu_quant(
+                #     hidden_states, group_list=group_list, group_list_type=group_list_type
+                # )
+                hidden_states, swiglu_out_scale = apply_moe_activation_triton(act, hidden_states, group_list=group_list, group_list_type=group_list_type)
             else:
-                hidden_states = torch_npu.npu_swiglu(hidden_states)
+                # hidden_states = torch_npu.npu_swiglu(hidden_states)
+                hidden_states = apply_moe_activation(act, hidden_states)
                 hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(
@@ -320,6 +338,45 @@ def quant_apply_mlp(
     return hidden_states
 
 
+def apply_moe_activation_triton(
+    activation: MoEActivation,
+    hidden_states: torch.Tensor,
+    group_list,
+    group_list_type
+) -> torch.Tensor:
+    if activation == MoEActivation.SILU:
+        from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+        hidden_states, swiglu_out_scale = swiglu_quant(
+            hidden_states, group_list=group_list, group_list_type=group_list_type
+        )
+
+    elif activation == MoEActivation.SWIGLUSTEP:
+        from vllm_ascend.ops.triton.activation.swiglu_quant import swiglu_quant
+        hidden_states, swiglu_out_scale = swiglu_quant(
+            hidden_states, group_list=group_list, group_list_type=group_list_type, use_step=True, limit=7.0
+        )
+
+
+    else:
+        raise ValueError(f"Unsupported FusedMoE activation: {activation}")
+    return hidden_states, swiglu_out_scale
+
+
+def apply_moe_activation(
+    activation: MoEActivation,
+    gate_up_out: torch.Tensor,
+) -> torch.Tensor:
+    if activation == MoEActivation.SILU:
+        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+    elif activation == MoEActivation.SWIGLUSTEP:
+        gate_up_out = swiglustep_and_mul(gate_up_out, limit=7.0)
+
+    else:
+        raise ValueError(f"Unsupported FusedMoE activation: {activation}")
+    return gate_up_out
+
+
 def unquant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -327,7 +384,7 @@ def unquant_apply_mlp(
     group_list: torch.Tensor,
     w1_bias: torch.Tensor = None,
     w2_bias: torch.Tensor = None,
-    activation: str | None = None,
+    activation: MoEActivation | None = None,
     group_list_type: int = 1,
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
@@ -346,11 +403,15 @@ def unquant_apply_mlp(
         group_list=group_list,
     )[0]
 
-    if activation == "swigluoai":
+    # apply_moe_activation expects `str`, but `activation` can be None.
+    # Default to "silu" to match fused_moe default behavior.
+    act: MoEActivation = activation or MoEActivation.SILU
+
+    if act == "swigluoai":
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
     else:
-        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+        gate_up_out = apply_moe_activation(act, gate_up_out)
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
@@ -364,6 +425,7 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
+
     return hidden_states
 
 
@@ -444,4 +506,5 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         scale_type=scale_type,
         per_token_scale_type=per_token_scale_type,
         use_bf16=use_bf16,
+        activation=activation,
     )

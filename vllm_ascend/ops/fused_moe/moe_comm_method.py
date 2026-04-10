@@ -18,6 +18,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from typing import Any, Optional, Union
 import torch
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -46,7 +47,6 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
-
 
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
     return _MoECommMethods.get(moe_comm_type)
